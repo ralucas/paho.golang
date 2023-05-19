@@ -28,7 +28,6 @@ func TestMidNoExhaustion(t *testing.T) {
 	require.NotNil(t, c)
 
 	c.serverInflight = semaphore.NewWeighted(10)
-	c.clientInflight = semaphore.NewWeighted(10)
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -56,7 +55,7 @@ func TestMidExhaustion(t *testing.T) {
 	require.NotNil(t, c)
 
 	c.serverInflight = semaphore.NewWeighted(10)
-	c.clientInflight = semaphore.NewWeighted(10)
+	c.clientSendQuota.Store(uintptr(10))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	c.SetDebugLogger(log.New(os.Stderr, "PUBLISHQOS1: ", log.LstdFlags))

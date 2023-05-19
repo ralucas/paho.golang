@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eclipse/paho.golang/packets"
@@ -23,9 +24,7 @@ const (
 
 const defaultSendAckInterval = 50 * time.Millisecond
 
-var (
-	ErrManualAcknowledgmentDisabled = errors.New("manual acknowledgments disabled")
-)
+var ErrManualAcknowledgmentDisabled = errors.New("manual acknowledgments disabled")
 
 type (
 	// ClientConfig are the user configurable options for the client, an
@@ -71,17 +70,17 @@ type (
 		mu sync.Mutex
 		ClientConfig
 		// raCtx is used for handling the MQTTv5 authentication exchange.
-		raCtx          *CPContext
-		stop           chan struct{}
-		publishPackets chan *packets.Publish
-		acksTracker    acksTracker
-		workers        sync.WaitGroup
-		serverProps    CommsProperties
-		clientProps    CommsProperties
-		serverInflight *semaphore.Weighted
-		clientInflight *semaphore.Weighted
-		debug          Logger
-		errors         Logger
+		raCtx           *CPContext
+		stop            chan struct{}
+		publishPackets  chan *packets.Publish
+		acksTracker     acksTracker
+		workers         sync.WaitGroup
+		serverProps     CommsProperties
+		clientProps     CommsProperties
+		serverInflight  *semaphore.Weighted
+		clientSendQuota *atomic.Uintptr
+		debug           Logger
+		errors          Logger
 	}
 
 	// CommsProperties is a struct of the communication properties that may
@@ -153,6 +152,10 @@ func NewClient(conf ClientConfig) *Client {
 	}
 	if c.OnClientError == nil {
 		c.OnClientError = func(e error) {}
+	}
+
+	if c.clientSendQuota == nil {
+		c.clientSendQuota = new(atomic.Uintptr)
 	}
 
 	return c
@@ -279,7 +282,7 @@ func (c *Client) Connect(ctx context.Context, cp *Connect) (*Connack, error) {
 	}
 
 	c.serverInflight = semaphore.NewWeighted(int64(c.serverProps.ReceiveMaximum))
-	c.clientInflight = semaphore.NewWeighted(int64(c.clientProps.ReceiveMaximum))
+	c.clientSendQuota.Store(uintptr(c.clientProps.ReceiveMaximum))
 
 	c.debug.Println("received CONNACK, starting PingHandler")
 	c.workers.Add(1)
@@ -382,6 +385,11 @@ func (c *Client) routePublishPackets() {
 				return
 			}
 
+			// Suspend no matter QoS
+			if c.clientSendQuota.Load() == uintptr(0) {
+				continue
+			}
+
 			if !c.ClientConfig.EnableManualAcknowledgment {
 				c.Router.Route(pb)
 				c.ack(pb)
@@ -441,6 +449,7 @@ func (c *Client) incoming() {
 			case packets.PUBLISH:
 				pb := recv.Content.(*packets.Publish)
 				c.debug.Printf("received QoS%d PUBLISH", pb.QoS)
+				c.decrementSendQuota()
 				c.mu.Lock()
 				select {
 				case <-c.stop:
@@ -456,6 +465,11 @@ func (c *Client) incoming() {
 					cpCtx.Return <- *recv
 				} else {
 					c.debug.Println("received a response for a message ID we don't know:", recv.PacketID())
+				}
+				// increment quota each time a PUBACK or PUBCOMP packet is received,
+				// regardless of whether the PUBACK or PUBCOMP carried an error code.
+				if recv.Type == packets.PUBACK || recv.Type == packets.PUBCOMP {
+					c.incrementSendQuota()
 				}
 			case packets.PUBREC:
 				c.debug.Println("received PUBREC for", recv.PacketID())
@@ -473,7 +487,8 @@ func (c *Client) incoming() {
 				} else {
 					pr := recv.Content.(*packets.Pubrec)
 					if pr.ReasonCode >= 0x80 {
-						//Received a failure code, shortcut and return
+						c.incrementSendQuota()
+						// Received a failure code, shortcut and return
 						cpCtx.Return <- *recv
 					} else {
 						pl := packets.Pubrel{
@@ -488,10 +503,10 @@ func (c *Client) incoming() {
 				}
 			case packets.PUBREL:
 				c.debug.Println("received PUBREL for", recv.PacketID())
-				//Auto respond to pubrels unless failure code
+				// Auto respond to pubrels unless failure code
 				pr := recv.Content.(*packets.Pubrel)
 				if pr.ReasonCode >= 0x80 {
-					//Received a failure code, continue
+					// Received a failure code, continue
 					continue
 				} else {
 					pc := packets.Pubcomp{
@@ -530,7 +545,7 @@ func (c *Client) close() {
 
 	select {
 	case <-c.stop:
-		//already shutting down, do nothing
+		// already shutting down, do nothing
 		return
 	default:
 	}
@@ -603,8 +618,8 @@ func (c *Client) Authenticate(ctx context.Context, a *Auth) (*AuthResponse, erro
 
 	switch rp.Type {
 	case packets.AUTH:
-		//If we've received one here it must be successful, the only way
-		//to abort a reauth is a server initiated disconnect
+		// If we've received one here it must be successful, the only way
+		// to abort a reauth is a server initiated disconnect
 		return AuthResponseFromPacketAuth(rp.Content.(*packets.Auth)), nil
 	case packets.DISCONNECT:
 		return AuthResponseFromPacketDisconnect(rp.Content.(*packets.Disconnect)), nil
@@ -893,7 +908,24 @@ func (c *Client) expectConnack(packet chan<- *packets.Connack, errs chan<- error
 	default:
 		errs <- fmt.Errorf("received unexpected packet %v", recv.Type)
 	}
+}
 
+func (c *Client) decrementSendQuota() {
+	if c.clientSendQuota.Load() == uintptr(0) {
+		return
+	}
+	c.clientSendQuota.Add(^uintptr(0))
+}
+
+func (c *Client) incrementSendQuota() {
+	// The send quota is not incremented if it is already equal
+	// to the initial send quota. The attempt to increment above
+	// the initial send quota might be caused by the re-transmission
+	// of a PUBREL packet after a new Network Connection is established.
+	if c.clientSendQuota.Load() == uintptr(c.clientProps.ReceiveMaximum) {
+		return
+	}
+	c.clientSendQuota.Add(uintptr(1))
 }
 
 // Disconnect is used to send a Disconnect packet to the MQTT server

@@ -169,7 +169,7 @@ func TestClientPublishQoS0(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "PUBLISHQOS0: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -203,7 +203,7 @@ func TestClientPublishQoS1(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "PUBLISHQOS1: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -242,7 +242,7 @@ func TestClientPublishQoS2(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "PUBLISHQOS2: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -280,7 +280,7 @@ func TestClientReceiveQoS0(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "RECEIVEQOS0: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -316,7 +316,7 @@ func TestClientReceiveQoS1(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "RECEIVEQOS1: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -352,7 +352,7 @@ func TestClientReceiveQoS2(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "RECEIVEQOS2: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
+	c.clientSendQuota.Store(uintptr(10000))
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -552,7 +552,6 @@ func TestReceiveServerDisconnect(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "SERVERDISCONNECT: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -585,7 +584,6 @@ func TestAuthenticate(t *testing.T) {
 	c.SetDebugLogger(log.New(os.Stderr, "AUTHENTICATE: ", log.LstdFlags))
 
 	c.serverInflight = semaphore.NewWeighted(10000)
-	c.clientInflight = semaphore.NewWeighted(10000)
 	c.stop = make(chan struct{})
 	c.publishPackets = make(chan *packets.Publish)
 	go c.incoming()
@@ -604,6 +602,87 @@ func TestAuthenticate(t *testing.T) {
 	assert.True(t, ar.Success)
 
 	time.Sleep(10 * time.Millisecond)
+}
+
+func TestClientSendQuota(t *testing.T) {
+	ts := newTestServer()
+	ts.SetResponse(packets.CONNACK, &packets.Connack{
+		ReasonCode:     0,
+		SessionPresent: false,
+		Properties: &packets.Properties{
+			MaximumPacketSize: Uint32(12345),
+			MaximumQOS:        Byte(1),
+			ReceiveMaximum:    Uint16(3),
+			TopicAliasMaximum: Uint16(200),
+		},
+	})
+	go ts.Run()
+	defer ts.Stop()
+
+	var (
+		wg                   sync.WaitGroup
+		actualPublishPackets []packets.Publish
+		expectedPacketsCount = 3
+	)
+
+	wg.Add(expectedPacketsCount)
+	c := NewClient(ClientConfig{
+		Conn: ts.ClientConn(),
+		Router: NewSingleHandlerRouter(func(p *Publish) {
+			defer wg.Done()
+			actualPublishPackets = append(actualPublishPackets, *p.Packet())
+		}),
+	})
+	require.NotNil(t, c)
+	c.SetDebugLogger(log.New(os.Stderr, "RECEIVEORDER: ", log.LstdFlags))
+	t.Cleanup(c.close)
+
+	ctx := context.Background()
+	ca, err := c.Connect(ctx, &Connect{
+		KeepAlive:  30,
+		ClientID:   "testClient",
+		CleanStart: true,
+		Properties: &ConnectProperties{
+			ReceiveMaximum: Uint16(3),
+		},
+	})
+	require.Nil(t, err)
+	assert.Equal(t, uint8(0), ca.ReasonCode)
+
+	var expectedPublishPackets []packets.Publish
+	for i := 1; i <= expectedPacketsCount; i++ {
+		p := packets.Publish{
+			PacketID: uint16(i),
+			Topic:    fmt.Sprintf("test/%d", i),
+			Payload:  []byte(fmt.Sprintf("test payload %d", i)),
+			QoS:      1,
+			Properties: &packets.Properties{
+				User: make([]packets.User, 0),
+			},
+		}
+		expectedPublishPackets = append(expectedPublishPackets, p)
+		require.NoError(t, ts.SendPacket(&p))
+	}
+
+	wg.Wait()
+
+	require.Equal(t, expectedPublishPackets, actualPublishPackets)
+	expectedAcks := []packets.Puback{
+		{PacketID: 1, ReasonCode: 0, Properties: &packets.Properties{}},
+		{PacketID: 2, ReasonCode: 0, Properties: &packets.Properties{}},
+		{PacketID: 3, ReasonCode: 0, Properties: &packets.Properties{}},
+	}
+	require.Eventually(t,
+		func() bool {
+			return cmp.Equal(expectedAcks, ts.ReceivedPubacks())
+		},
+		time.Second,
+		10*time.Millisecond,
+		cmp.Diff(expectedAcks, ts.ReceivedPubacks()),
+	)
+	assert.Equal(t, uintptr(0), c.clientSendQuota.Load())
+
+	c.stop <- struct{}{}
 }
 
 type TestAuth struct {
